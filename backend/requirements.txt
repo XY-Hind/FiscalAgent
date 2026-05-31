@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+supabase
+langchain
+langchain-google-genai
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary]
+slowapi
+llm-guard
+guardrails-ai
+langfuse
+ragas
+apscheduler
+python-dotenv
