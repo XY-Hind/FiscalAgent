@@ -1,13 +1,25 @@
 import os
 import operator
-from typing import Annotated, Sequence, TypedDict
+from typing import Annotated, Sequence, TypedDict, Any, List
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
+from supabase import create_client, Client
+from flashrank import Ranker, RerankRequest
 
 from backend.models.output import AnswerWithEvidence
-from backend.services.ingestion import get_gemini_embeddings_model
+from backend.models.validation import output_guard
+from backend.utils.logger import logger
+
+# Initialize Supabase client
+supabase_url = os.environ.get("SUPABASE_URL", "")
+supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
+
+# Initialize FlashRank (lightweight local reranker)
+ranker = Ranker()
 
 # -----------------
 # 1. State Definition
@@ -16,6 +28,7 @@ class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     query: str
     metadata_filters: dict
+    retrieved_docs: List[dict]
     retrieved_context: str
     context_is_relevant: bool
     final_output: AnswerWithEvidence | None
@@ -25,17 +38,38 @@ class GraphState(TypedDict):
 # 2. Nodes
 # -----------------
 
+class QueryFilters(BaseModel):
+    optimized_query: str = Field(description="The rewritten search query optimized for embedding and keyword search.")
+    metadata_filters: dict = Field(description="Extracted metadata filters like company, year, section, gstin. Keys must match path_metadata keys.")
+
 def parse_query(state: GraphState):
     """
-    Parses the raw user question into optimized keywords and strict metadata filters.
+    Uses Groq API to parse the user question into optimized keywords and strict metadata filters.
     """
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0)
+    logger.info("Parsing user query for metadata extraction...")
+    llm = ChatGroq(
+        model="llama-3.3-70b-versatile",
+        groq_api_key=os.getenv("GROQ_API_KEY"),
+        temperature=0
+    )
     user_message = state["messages"][-1].content
     
-    # In a real app, we'd use LLM with structured output to extract filters (e.g. {"gstin": "...", "year": 2024})
-    # Mocking extraction for demonstration
-    optimized_query = user_message
-    filters = {"year": 2024} # Mock
+    llm_with_tool = llm.with_structured_output(QueryFilters)
+    prompt = (
+        f"You are a financial query parser. Analyze this user query and extract an optimized search query "
+        f"and any explicit metadata filters (company, year, section, gstin).\n\n"
+        f"Query: {user_message}"
+    )
+    
+    try:
+        parsed = llm_with_tool.invoke(prompt)
+        optimized_query = parsed.optimized_query
+        filters = parsed.metadata_filters
+        logger.info(f"Extracted filters: {filters}")
+    except Exception as e:
+        logger.error(f"Query parsing failed: {e}")
+        optimized_query = user_message
+        filters = {}
     
     return {
         "query": optimized_query, 
@@ -48,9 +82,86 @@ def retrieve(state: GraphState):
     Retrieves documents from Supabase using the RRF RPC function.
     """
     query = state["query"]
-    # Mock retrieval from Supabase RRF
-    retrieved_docs = "Mock context: Tata Motors revenue increased by 20% in FY 24-25. Exact Quote: 'Revenue increased by 20%'"
-    return {"retrieved_context": retrieved_docs}
+    filters = state["metadata_filters"]
+    logger.info(f"Retrieving chunks for query: '{query}' with filters: {filters}")
+    
+    if not supabase:
+        logger.error("Supabase client not initialized.")
+        return {"retrieved_docs": [], "retrieved_context": "Supabase client not initialized."}
+
+    from backend.services.ingestion import get_gemini_embeddings_model
+    embeddings_model = get_gemini_embeddings_model()
+    
+    try:
+        query_embedding = embeddings_model.embed_query(query)
+        
+        # Call RRF RPC function
+        response = supabase.rpc("match_chunks_rrf", {
+            "query_text": query,
+            "query_embedding": query_embedding,
+            "metadata_filter": filters,
+            "match_count": 25, # Retrieve slightly more for reranking
+            "rrf_k": 60
+        }).execute()
+        
+        docs = response.data or []
+        logger.info(f"Retrieved {len(docs)} raw chunks from Supabase.")
+        return {"retrieved_docs": docs}
+            
+    except Exception as e:
+        logger.error(f"Supabase retrieval failed: {e}")
+        return {"retrieved_docs": [], "retrieved_context": f"Error during retrieval: {str(e)}"}
+
+def rerank(state: GraphState):
+    """
+    Reranks the retrieved documents using FlashRank for higher precision.
+    """
+    query = state["query"]
+    docs = state["retrieved_docs"]
+    
+    if not docs:
+        logger.warning("No documents to rerank.")
+        return {"retrieved_context": "No relevant documents found."}
+    
+    logger.info(f"Reranking {len(docs)} documents using FlashRank...")
+    
+    try:
+        # Prepare passages for FlashRank
+        passages = []
+        for doc in docs:
+            passages.append({
+                "id": doc.get("chunk_id"),
+                "text": doc.get("content"),
+                "meta": {
+                    "title": doc.get("document_title"),
+                    "path": doc.get("path_metadata")
+                }
+            })
+        
+        # Execute Reranking
+        rerank_request = RerankRequest(query=query, passages=passages)
+        reranked_results = ranker.rerank(rerank_request)
+        
+        # Take top 10 after reranking
+        top_results = reranked_results[:10]
+        logger.info(f"Reranking complete. Top score: {top_results[0].get('score') if top_results else 'N/A'}")
+        
+        # Format context pieces
+        context_pieces = []
+        for res in top_results:
+            meta = res.get("meta", {})
+            context_pieces.append(
+                f"Document: {meta.get('title', 'Unknown')}\n"
+                f"Path: {meta.get('path', {})}\n"
+                f"Content:\n{res.get('text')}"
+            )
+        
+        retrieved_context = "\n\n---\n\n".join(context_pieces)
+        return {"retrieved_context": retrieved_context}
+    except Exception as e:
+        logger.error(f"FlashRank reranking failed: {e}")
+        # Fallback to top retrieved docs without reranking
+        return {"retrieved_context": "\n\n---\n\n".join([d.get("content") for d in docs[:10]])}
 
 class Grade(BaseModel):
     is_relevant: bool = Field(description="True if the context contains the answer, False otherwise")
@@ -59,42 +170,64 @@ def grade_context(state: GraphState):
     """
     Explicitly grade the context for relevance.
     """
+    logger.info("Grading retrieved context relevance...")
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
     llm_with_tool = llm.with_structured_output(Grade)
     
     prompt = f"Does the following context answer the user query?\nQuery: {state['query']}\nContext: {state['retrieved_context']}"
-    result = llm_with_tool.invoke(prompt)
+    try:
+        result = llm_with_tool.invoke(prompt)
+        is_relevant = result.is_relevant
+        logger.info(f"Context relevance grade: {is_relevant}")
+    except Exception as e:
+        logger.error(f"Context grading failed: {e}")
+        is_relevant = True # Fallback
     
-    return {"context_is_relevant": result.is_relevant}
+    return {"context_is_relevant": is_relevant}
 
 def reflect_and_rewrite(state: GraphState):
     """
     If context is poor, reflect on the failure and rewrite the query.
     """
+    logger.info(f"Context irrelevant. Rewriting query (Attempt {state['reflection_attempts'] + 1})...")
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0)
     prompt = f"The previous query '{state['query']}' did not retrieve relevant context. Rewrite it to be more specific or use different keywords."
     result = llm.invoke(prompt)
     
+    new_query = result.content.strip()
+    logger.info(f"New optimized query: '{new_query}'")
+    
     return {
-        "query": result.content.strip(),
+        "query": new_query,
         "reflection_attempts": state["reflection_attempts"] + 1
     }
 
 def generate_answer(state: GraphState):
     """
-    Generate structured output (AnswerWithEvidence) based on context.
+    Generate structured output based on context, validated.
     """
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0)
+    logger.info("Generating final answer with evidence...")
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0, streaming=True)
     llm_with_schema = llm.with_structured_output(AnswerWithEvidence)
     
     prompt = f"Answer the query based ONLY on the context. Provide exact quotes and bounding boxes if present in the context.\nQuery: {state['query']}\nContext: {state['retrieved_context']}"
     
-    result = llm_with_schema.invoke(prompt)
+    try:
+        result = llm_with_schema.invoke(prompt)
+        
+        # Output Security Integration
+        guard_result = output_guard.validate(result.model_dump())
+        if guard_result.validation_passed:
+            final_output = AnswerWithEvidence(**guard_result.validated_output)
+            logger.info("Final answer successfully validated.")
+        else:
+            logger.warning("Final answer failed validation. Returning raw output.")
+            final_output = result
+    except Exception as e:
+        logger.error(f"Answer generation failed: {e}")
+        final_output = AnswerWithEvidence(answer=f"Error generating answer: {str(e)}", reasoning="", citations=[])
     
-    # In a real app, this is where Guardrails AI would intercept the structured output
-    # to verify exact string quotes against `state['retrieved_context']`.
-    
-    return {"final_output": result}
+    return {"final_output": final_output}
 
 # -----------------
 # 3. Edges & Graph
@@ -111,13 +244,15 @@ workflow = StateGraph(GraphState)
 
 workflow.add_node("parse_query", parse_query)
 workflow.add_node("retrieve", retrieve)
+workflow.add_node("rerank", rerank)
 workflow.add_node("grade_context", grade_context)
 workflow.add_node("reflect_and_rewrite", reflect_and_rewrite)
 workflow.add_node("generate_answer", generate_answer)
 
 workflow.set_entry_point("parse_query")
 workflow.add_edge("parse_query", "retrieve")
-workflow.add_edge("retrieve", "grade_context")
+workflow.add_edge("retrieve", "rerank")
+workflow.add_edge("rerank", "grade_context")
 workflow.add_conditional_edges("grade_context", decide_next_step)
 workflow.add_edge("reflect_and_rewrite", "retrieve")
 workflow.add_edge("generate_answer", END)

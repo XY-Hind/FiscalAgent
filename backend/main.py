@@ -1,4 +1,9 @@
 import os
+import sys
+
+# Add the project root to the Python path to resolve backend module imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +12,8 @@ import psycopg
 from dotenv import load_dotenv
 
 from backend.api.chat import router as chat_router
-from backend.security.rate_limit import setup_rate_limiting
+from backend.middleware.rate_limit import setup_rate_limiting
+from backend.utils.logger import logger
 
 load_dotenv()
 
@@ -16,17 +22,21 @@ DB_URI = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:543
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize the LangGraph Postgres Checkpointer
-    async with psycopg.AsyncConnection.connect(DB_URI) as conn:
-        checkpointer = AsyncPostgresSaver(conn)
-        # As explicitly required in Phase 1: call the async .setup() method
-        await checkpointer.setup()
-        print("LangGraph Postgres Checkpointer setup complete.")
-        
-        # We attach it to the app state so routes can access the configured checkpointer
-        app.state.checkpointer = checkpointer
-        
-        yield
-        print("Shutting down...")
+    try:
+        async with psycopg.AsyncConnection.connect(DB_URI) as conn:
+            checkpointer = AsyncPostgresSaver(conn)
+            # As explicitly required in Phase 1: call the async .setup() method
+            await checkpointer.setup()
+            logger.info("LangGraph Postgres Checkpointer setup complete.")
+            
+            # We attach it to the app state so routes can access the configured checkpointer
+            app.state.checkpointer = checkpointer
+            
+            yield
+            logger.info("Shutting down...")
+    except Exception as e:
+        logger.error(f"Failed to initialize checkpointer: {e}")
+        raise
 
 app = FastAPI(title="MultiModal RAG API", lifespan=lifespan)
 

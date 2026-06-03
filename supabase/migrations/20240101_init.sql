@@ -19,6 +19,8 @@ CREATE TABLE document_chunks (
   context_string TEXT,
   -- Bounding boxes [ymin, xmin, ymax, xmax] scaled 0-1000
   bounding_boxes JSONB,
+  -- Structural path metadata (Company > Year > Section)
+  path_metadata JSONB,
   -- Dense embedding (768 dimensions for Gemini)
   embedding VECTOR(768),
   -- Sparse index
@@ -31,11 +33,24 @@ CREATE INDEX document_chunks_embedding_idx ON document_chunks USING hnsw (embedd
 -- Create an index for full-text search
 CREATE INDEX document_chunks_fts_idx ON document_chunks USING gin (fts);
 
+-- Create a table for Agent Lightning Telemetry
+CREATE TABLE agent_lightning_telemetry (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id TEXT NOT NULL,
+  query TEXT NOT NULL,
+  retrieval_latency_ms INT,
+  llm_latency_ms INT,
+  tokens_used INT,
+  optimization_metrics JSONB,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
 -- Create a function for Hybrid Search with Reciprocal Rank Fusion (RRF)
 -- Explicitly requested: K=60, RRF algorithm mathematically: score(d) = sum(1 / (k + rank_d))
 CREATE OR REPLACE FUNCTION match_chunks_rrf(
   query_text TEXT,
   query_embedding VECTOR(768),
+  metadata_filter JSONB DEFAULT '{}'::jsonb,
   match_count INT DEFAULT 20,
   rrf_k INT DEFAULT 60
 )
@@ -44,6 +59,7 @@ RETURNS TABLE (
   document_id UUID,
   content TEXT,
   bounding_boxes JSONB,
+  path_metadata JSONB,
   document_title TEXT,
   score FLOAT
 )
@@ -56,6 +72,7 @@ BEGIN
       id,
       ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank
     FROM document_chunks
+    WHERE path_metadata @> metadata_filter OR metadata_filter = '{}'::jsonb
     ORDER BY embedding <=> query_embedding
     LIMIT match_count
   ),
@@ -65,6 +82,7 @@ BEGIN
       ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts, plainto_tsquery('english', query_text)) DESC) AS rank
     FROM document_chunks
     WHERE fts @@ plainto_tsquery('english', query_text)
+      AND (path_metadata @> metadata_filter OR metadata_filter = '{}'::jsonb)
     ORDER BY ts_rank_cd(fts, plainto_tsquery('english', query_text)) DESC
     LIMIT match_count
   ),
@@ -81,6 +99,7 @@ BEGIN
     c.document_id,
     c.content,
     c.bounding_boxes,
+    c.path_metadata,
     docs.title,
     cm.score
   FROM combined_matches cm

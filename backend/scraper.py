@@ -1,94 +1,308 @@
 import os
+import sys
+
+# Add the project root to the Python path to resolve backend module imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import time
-import base64
 import json
-from apscheduler.schedulers.blocking import BlockingScheduler
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage
+import asyncio
+import tempfile
+import fitz  # PyMuPDF
+from typing import List, Tuple
+from pydantic import BaseModel, Field
+import google.generativeai as genai
+from supabase import create_client, Client
 from dotenv import load_dotenv
+
+from backend.services.ingestion import StructuralElement, process_structural_elements
+from backend.utils.logger import logger
 
 load_dotenv()
 
-def run_gemini_multimodal_extraction(pdf_path: str):
-    """
-    Simulates sending a PDF document page-by-page to Gemini Multimodal for 2D extraction.
-    Instructs Gemini to return bounding box coordinates [ymin, xmin, ymax, xmax] (scaled 0-1000).
-    """
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-pro",
-        google_api_key=os.getenv("GEMINI_API_KEY"),
-        temperature=0.0
-    )
-    
-    # In a real implementation, you would chunk the PDF into images or use Gemini's File API for PDFs.
-    # Here we mock the prompt assuming we pass a page image or PDF.
-    
-    prompt = """
-    Extract all text and tables from the provided document. 
-    You must perform 2D spatial extraction. For every distinct block of text, paragraph, or table row, 
-    you must provide its bounding box coordinates in the exact format: [ymin, xmin, ymax, xmax] where coordinates are normalized and scaled from 0 to 1000.
-    
-    Format your response as a JSON list of objects:
-    [
-      {
-        "text": "Extracted text content...",
-        "bounding_box": [ymin, xmin, ymax, xmax],
-        "type": "paragraph" | "table_row" | "heading"
-      }
-    ]
-    Ensure strictly valid JSON output without any markdown wrapping (no ```json).
-    """
-    
-    # Mocking execution for local test purposes. In real scenario:
-    # message = HumanMessage(content=[
-    #    {"type": "text", "text": prompt},
-    #    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
-    # ])
-    # response = llm.invoke([message])
-    
-    print(f"Executing Gemini Multimodal extraction on: {pdf_path}")
-    # Return mock structured data for demonstration
-    mock_response = [
-        {
-            "text": "Tata Motors Annual Report FY 24-25",
-            "bounding_box": [50, 100, 100, 900],
-            "type": "heading"
-        },
-        {
-            "text": "GSTIN: 27AAACT5555C1Z1",
-            "bounding_box": [120, 100, 150, 400],
-            "type": "paragraph"
-        }
-    ]
-    return mock_response
+# Configure raw Gemini SDK
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-def ingest_latest_reports():
-    """
-    Mock ingestion task. Normally this would scrape SEBI/RBI filings.
-    """
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting nightly ingestion pipeline...")
-    
-    # 1. Scrape (Mocked)
-    mock_pdf = "data/tata_motors_2024.pdf"
-    
-    # 2. Extract Multimodal content
-    extracted_data = run_gemini_multimodal_extraction(mock_pdf)
-    print(f"Extracted {len(extracted_data)} blocks with bounding boxes.")
-    
-    # 3. Validation & Supabase Storage (To be connected to services/ingestion.py and Supabase)
-    print("Ingestion pipeline finished.")
+# Initialize Supabase client
+supabase_url = os.getenv("SUPABASE_URL", "")
+supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
 
+class ExtractionOutput(BaseModel):
+    elements: List[StructuralElement] = Field(description="List of extracted structural elements with bounding boxes and types.")
+
+def get_logical_boundaries(pdf_path: str) -> List[Tuple[int, int]]:
+    """
+    Pass 1: Local Logical Boundary Detection (PyMuPDF)
+    Detects section boundaries using TOC or font-size heuristics.
+    Ensures 100% page coverage.
+    """
+    doc = fitz.open(pdf_path)
+    toc = doc.get_toc()
+    boundaries = []
+    total_pages = doc.page_count
+    
+    if toc:
+        logger.info("TOC detected, using for logical boundaries.")
+        current_page = 0
+        for i in range(len(toc)):
+            # toc[i][2] is 1-based page number
+            section_start = toc[i][2] - 1
+            
+            # 1. Handle gap before this section (e.g. cover pages)
+            if section_start > current_page:
+                boundaries.append((current_page, section_start - 1))
+            
+            # 2. Determine section end
+            if i + 1 < len(toc):
+                section_end = toc[i+1][2] - 2
+            else:
+                section_end = total_pages - 1
+            
+            # 3. Add section if valid
+            if section_start <= section_end:
+                # Merge with previous if overlapping
+                if boundaries and boundaries[-1][1] >= section_start:
+                    boundaries[-1] = (boundaries[-1][0], max(boundaries[-1][1], section_end))
+                else:
+                    boundaries.append((section_start, section_end))
+                current_page = section_end + 1
+        
+        # 4. Handle remaining pages
+        if current_page < total_pages:
+            boundaries.append((current_page, total_pages - 1))
+    else:
+        logger.info("No TOC detected, using font-size heuristics.")
+        current_start = 0
+        threshold = 30 # Default high threshold if sampling fails
+        
+        # Sample pages to find base font size
+        sample_pages = min(10, total_pages)
+        sizes = []
+        for i in range(sample_pages):
+            for block in doc[i].get_text("dict")["blocks"]:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            sizes.append(span["size"])
+        
+        if sizes:
+            avg_size = sum(sizes) / len(sizes)
+            threshold = avg_size * 1.6  # Heuristic for headings
+        
+        for page_num in range(total_pages):
+            page = doc[page_num]
+            found_heading = False
+            # Only look for headings in the top 25% of the page
+            page_height = page.rect.height
+            
+            for block in page.get_text("dict")["blocks"]:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        # Check vertical position
+                        if line["bbox"][1] > page_height * 0.25:
+                            continue 
+                            
+                        for span in line["spans"]:
+                            if span["size"] > threshold and page_num > current_start:
+                                boundaries.append((current_start, page_num - 1))
+                                current_start = page_num
+                                found_heading = True
+                                break
+                        if found_heading: break
+                if found_heading: break
+        
+        boundaries.append((current_start, total_pages - 1))
+
+    doc.close()
+    
+    # Final cleanup: filter invalid and merge contiguous
+    valid_boundaries = []
+    for start, end in boundaries:
+        if end >= start:
+            if valid_boundaries and valid_boundaries[-1][1] >= start - 1:
+                valid_boundaries[-1] = (valid_boundaries[-1][0], max(valid_boundaries[-1][1], end))
+            else:
+                valid_boundaries.append((start, end))
+                
+    logger.info(f"Final logical boundaries: {valid_boundaries}")
+    return valid_boundaries
+
+def slice_pdf(pdf_path: str, start_page: int, end_page: int) -> str:
+    """
+    Pass 2: Dynamic PDF Slicing
+    Physically slices the PDF into a temporary file.
+    """
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_path = temp_file.name
+    temp_file.close()
+    
+    src = fitz.open(pdf_path)
+    dest = fitz.open()
+    dest.insert_pdf(src, from_page=start_page, to_page=end_page)
+    dest.save(temp_path)
+    dest.close()
+    src.close()
+    
+    return temp_path
+
+async def upload_to_gemini_async(path: str, mime_type: str = "application/pdf"):
+    """
+    Uploads a file to Gemini File API asynchronously.
+    """
+    try:
+        # genai.upload_file is synchronous, but we can wrap it or just use it as is
+        # for simplicity since it's one-off per chunk. 
+        # Actually, let's keep it simple for now as the main bottleneck is generate_content.
+        loop = asyncio.get_running_loop()
+        file = await loop.run_in_executor(None, lambda: genai.upload_file(path, mime_type=mime_type))
+        logger.info(f"Uploaded chunk '{file.display_name}' as: {file.uri}")
+        
+        while file.state.name == "PROCESSING":
+            await asyncio.sleep(2)
+            file = await loop.run_in_executor(None, lambda: genai.get_file(file.name))
+            
+        if file.state.name == "FAILED":
+            raise Exception(f"File processing failed: {file.state.name}")
+        
+        return file
+    except Exception as e:
+        logger.error(f"Failed to upload {path}: {e}")
+        raise
+
+async def process_section_async(pdf_path: str, start_page: int, end_page: int, semaphore: asyncio.Semaphore) -> List[StructuralElement]:
+    """
+    Pass 3: Asynchronous Gemini Processing
+    """
+    async with semaphore:
+        temp_slice = None
+        gemini_file = None
+        try:
+            # Slice PDF
+            temp_slice = slice_pdf(pdf_path, start_page, end_page)
+            
+            # Upload to Gemini
+            gemini_file = await upload_to_gemini_async(temp_slice)
+            
+            # Initialize model
+            model = genai.GenerativeModel("gemini-1.5-pro")
+            
+            prompt = """
+            Extract all text and tables from the provided document section. 
+            You must perform 2D spatial extraction. For every distinct block of text, paragraph, or table row, 
+            you must provide its bounding box coordinates in the exact format: [ymin, xmin, ymax, xmax] 
+            where coordinates are normalized and scaled from 0 to 1000.
+            
+            Classify each block as 'paragraph', 'table_row', or 'heading'.
+            """
+            
+            response = await model.generate_content_async(
+                [prompt, gemini_file],
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                    response_schema=ExtractionOutput
+                )
+            )
+            
+            output = ExtractionOutput.model_validate_json(response.text)
+            return output.elements
+        except Exception as e:
+            logger.error(f"Failed processing section {start_page}-{end_page}: {e}")
+            return []
+        finally:
+            if temp_slice and os.path.exists(temp_slice):
+                os.remove(temp_slice)
+            if gemini_file:
+                try:
+                    genai.delete_file(gemini_file.name)
+                except:
+                    pass
+
+async def run_batch_extraction(pdf_path: str) -> List[StructuralElement]:
+    """
+    Orchestrates the two-pass batching architecture.
+    """
+    # 1. Detect boundaries
+    boundaries = get_logical_boundaries(pdf_path)
+    
+    # 2. Process sections asynchronously with concurrency limit
+    semaphore = asyncio.Semaphore(5)
+    tasks = [process_section_async(pdf_path, start, end, semaphore) for start, end in boundaries]
+    
+    results = await asyncio.gather(*tasks)
+    
+    # Merge results sequentially to maintain original document flow
+    all_elements = []
+    for section_elements in results:
+        all_elements.extend(section_elements)
+    
+    return all_elements
+
+def ingest_reports():
+    """
+    Production ingestion pipeline with Two-Pass Dynamic Batching.
+    """
+    input_pdf_path = os.getenv("PDF_INPUT_PATH", "placeholder_path") 
+    doc_title = os.path.basename(input_pdf_path) if input_pdf_path != "placeholder_path" else "Financial Report"
+    
+    if input_pdf_path == "placeholder_path" or not os.path.exists(input_pdf_path):
+        logger.warning(f"Skipping ingestion: Path '{input_pdf_path}' not found.")
+        return
+
+    logger.info(f"Starting Two-Pass Dynamic Batching extraction on {input_pdf_path}...")
+    
+    # Run async extraction
+    elements = asyncio.run(run_batch_extraction(input_pdf_path))
+    
+    logger.info(f"Extracted total of {len(elements)} structural elements.")
+    
+    if not elements:
+        logger.error("No elements extracted. Ingestion pipeline aborted.")
+        return
+
+    # TODO: Extract real path metadata (Company, Year, etc.) dynamically from headings
+    path_metadata = {"company": "Unknown", "year": 2024} 
+    chunk_results = process_structural_elements(doc_title, elements, path_metadata)
+    logger.info(f"Generated {len(chunk_results)} semantically grouped chunks.")
+    
+    if not supabase:
+        logger.error("Supabase client not initialized. Cannot persist data.")
+        return
+
+    try:
+        # 1. Create document record
+        doc_resp = supabase.table("documents").insert({
+            "title": doc_title,
+            "metadata": path_metadata
+        }).execute()
+        
+        if not doc_resp.data:
+            raise Exception("Failed to create document record.")
+            
+        doc_id = doc_resp.data[0]["id"]
+        logger.info(f"Created document record with ID: {doc_id}")
+        
+        # 2. Prepare chunks for batch insert
+        chunks_to_insert = []
+        for chunk in chunk_results:
+            chunks_to_insert.append({
+                "document_id": doc_id,
+                "content": chunk.text,
+                "context_string": chunk.context_string,
+                "embedding": chunk.embedding,
+                "bounding_boxes": chunk.bounding_boxes,
+                "path_metadata": chunk.path_metadata
+            })
+            
+        # 3. Batch insert chunks
+        if chunks_to_insert:
+            chunk_resp = supabase.table("document_chunks").insert(chunks_to_insert).execute()
+            logger.info(f"Successfully batch inserted {len(chunk_resp.data)} chunks into Supabase.")
+        
+    except Exception as e:
+        logger.error(f"Failed to persist data to Supabase: {e}")
+        
+    logger.info("Ingestion pipeline execution finished.")
 
 if __name__ == "__main__":
-    print("Starting APScheduler for Nightly Ingestion...")
-    scheduler = BlockingScheduler()
-    # Run every night at 2 AM
-    scheduler.add_job(ingest_latest_reports, 'cron', hour=2, minute=0)
-    
-    # Run once immediately for local testing
-    ingest_latest_reports()
-    
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    ingest_reports()

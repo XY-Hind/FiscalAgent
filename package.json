@@ -1,0 +1,8 @@
+{
+  "devDependencies": {
+    "supabase": "^2.104.0"
+  },
+  "dependencies": {
+    "@toon-format/toon": "^2.3.0"
+  }
+}

@@ -1,7 +1,12 @@
 import re
 from datetime import date, datetime
-from typing import Any
-from pydantic import BaseModel, field_validator, ValidationInfo
+from typing import Any, Type, TypeVar
+from pydantic import BaseModel, field_validator, ValidationError
+
+# Local imports
+from backend.models.output import AnswerWithEvidence
+
+T = TypeVar("T", bound=BaseModel)
 
 # GSTIN format regex
 GSTIN_REGEX = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}$")
@@ -14,18 +19,18 @@ def luhn_mod_36_checksum(gstin: str) -> bool:
         return False
     
     factor = 1
-    sum = 0
+    sum_val = 0
     # Process the first 14 characters
     for char in gstin[:-1]:
         code_point = CHARS.index(char)
         addend = factor * code_point
         # Add the two digits of the base-36 representation of the addend
-        sum += (addend // 36) + (addend % 36)
+        sum_val += (addend // 36) + (addend % 36)
         # Alternate factor between 1 and 2
         factor = 2 if factor == 1 else 1
     
     # Calculate checksum character
-    remainder = sum % 36
+    remainder = sum_val % 36
     check_code_point = (36 - remainder) % 36
     expected_char = CHARS[check_code_point]
     
@@ -42,7 +47,7 @@ class DocumentMetadata(BaseModel):
     def validate_gstin(cls, v: str | None) -> str | None:
         if not v:
             return v
-        v = v.upper()
+        v = v.upper().replace(" ", "")
         if not GSTIN_REGEX.match(v):
             raise ValueError(f"Invalid GSTIN format: {v}")
         if not luhn_mod_36_checksum(v):
@@ -54,12 +59,11 @@ class DocumentMetadata(BaseModel):
     def parse_fiscal_date(cls, v: Any) -> date | None:
         if not v:
             return None
-        # Custom logic to handle formats like "FY 24-25" or "15th August 2025"
         if isinstance(v, date):
             return v
         if isinstance(v, str):
-            # Very basic handling; real implementation would use dateutil or LLM normalization
             v = v.lower().strip()
+            # Normalize robustly
             if v.startswith("fy"):
                 # E.g. "FY 24-25" -> Assume end of fiscal year 2025-03-31
                 parts = v.replace("fy", "").strip().split("-")
@@ -74,5 +78,40 @@ class DocumentMetadata(BaseModel):
                 # ISO format parse
                 return datetime.fromisoformat(v).date()
             except ValueError:
-                pass
+                # Try strptime fallbacks
+                try:
+                    return datetime.strptime(v, "%dth %B %Y").date()
+                except ValueError:
+                    try:
+                        return datetime.strptime(v, "%d %b %Y").date()
+                    except ValueError:
+                        pass
         raise ValueError(f"Unable to parse fiscal_date: {v}")
+
+class GuardResult:
+    def __init__(self, validation_passed: bool, validated_output: Any):
+        self.validation_passed = validation_passed
+        self.validated_output = validated_output
+
+class NativeGuard:
+    """
+    A lightweight, Python 3.13 compatible replacement for Guardrails AI.
+    Handles Pydantic validation and provides a similar interface.
+    """
+    def __init__(self, output_class: Type[T]):
+        self.output_class = output_class
+
+    def validate(self, data: Any) -> GuardResult:
+        try:
+            # If data is already a model, dump it to dict first
+            if isinstance(data, BaseModel):
+                data = data.model_dump()
+            
+            validated = self.output_class(**data)
+            return GuardResult(validation_passed=True, validated_output=validated.model_dump())
+        except (ValidationError, TypeError, ValueError):
+            return GuardResult(validation_passed=False, validated_output=data)
+
+# Create NativeGuard for output validation
+output_guard = NativeGuard(output_class=AnswerWithEvidence)
+

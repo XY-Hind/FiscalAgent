@@ -127,6 +127,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.env.keys
+.env.local
+.env.*.local
 
 # Spyder project settings
 .spyderproject
@@ -168,6 +171,12 @@ frontend/*.log
 frontend/npm-debug.log*
 frontend/yarn-debug.log*
 frontend/yarn-error.log*
+node_modules/
+
+#Supabase
+config.toml
+.branches
+.temp
 
 # OS files
 .DS_Store

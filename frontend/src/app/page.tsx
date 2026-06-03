@@ -1,36 +1,37 @@
+"use client";
+
+import { useState, useEffect } from "react";
 import { Chat } from "@/components/chat";
+import { Moon, Sun } from "lucide-react";
 
 export default function Home() {
-  return (
-    <main className="flex h-screen bg-white">
-      {/* Left side: PDF Viewer Placeholder */}
-      <div className="flex-1 border-r bg-gray-50 p-8 flex flex-col relative">
-        <h2 className="text-xl font-bold mb-4 text-black">Document Viewer</h2>
-        <div className="flex-1 bg-white border shadow-sm relative overflow-hidden flex items-center justify-center text-gray-400">
-          <p>PDF will be rendered here.</p>
-          
-          {/* Example of how a bounding box would be rendered over the PDF based on [ymin, xmin, ymax, xmax] */}
-          {/* Using normalized coordinates (0-1000) converted to percentages for CSS top, left, width, height */}
-          {/* Example coordinates: [100, 50, 150, 300] -> ymin=10%, xmin=5%, ymax=15%, xmax=30% */}
-          {/* <div 
-            className="absolute border-2 border-red-500 bg-yellow-200/30 transition-all duration-300 pointer-events-none"
-            style={{ 
-              top: '10%', 
-              left: '5%', 
-              height: '5%', // 15% - 10%
-              width: '25%'  // 30% - 5%
-            }}
-          /> */}
-        </div>
-      </div>
+  const [isDarkMode, setIsDarkMode] = useState(false);
 
-      {/* Right side: Agent Chat Interface */}
-      <div className="w-[450px] flex flex-col bg-white">
-        <div className="p-4 border-b bg-gray-50">
-          <h1 className="text-lg font-bold text-black">Financial RAG Agent</h1>
-          <p className="text-xs text-gray-500">Gemini 1.5 Pro | RRF Hybrid Search</p>
+  useEffect(() => {
+    if (isDarkMode) {
+      document.documentElement.classList.add("dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+    }
+  }, [isDarkMode]);
+
+  return (
+    <main className="flex h-screen bg-gray-50 dark:bg-gray-900 transition-colors duration-200">
+      <div className="flex-1 flex flex-col max-w-5xl mx-auto bg-white dark:bg-gray-950 shadow-xl border-x border-gray-200 dark:border-gray-800">
+        <div className="p-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-white dark:bg-gray-950">
+          <div>
+            <h1 className="text-xl font-bold text-gray-900 dark:text-white">FiscalAgent</h1>
+            <p className="text-xs text-gray-500 dark:text-gray-400">Advanced Financial RAG Agent</p>
+          </div>
+          <button 
+            onClick={() => setIsDarkMode(!isDarkMode)}
+            className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 transition-colors"
+            title="Toggle Theme"
+          >
+            {isDarkMode ? <Sun size={20} /> : <Moon size={20} />}
+          </button>
         </div>
-        <div className="flex-1 overflow-hidden">
+        <div className="flex-1 overflow-hidden relative">
           <Chat />
         </div>
       </div>

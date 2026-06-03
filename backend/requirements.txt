@@ -5,13 +5,16 @@ pydantic-settings
 supabase
 langchain
 langchain-google-genai
+langchain-groq
+google-generativeai
 langgraph
 langgraph-checkpoint-postgres
 psycopg[binary]
 slowapi
 llm-guard
-guardrails-ai
+flashrank
 langfuse
 ragas
 apscheduler
 python-dotenv
+pymupdf

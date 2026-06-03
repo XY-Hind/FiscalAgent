@@ -1,28 +1,35 @@
 # FiscalAgent: MultiModal RAG for Financial Reports
 
-This is an agentic, enterprise-grade RAG system designed to process complex Indian corporate annual reports (e.g., Reliance, Tata). It uses advanced spatial extraction, hybrid search, and the Reflexion pattern for high-accuracy financial analytics.
+This is an agentic, enterprise-grade RAG system designed to process complex corporate annual reports. It uses advanced spatial extraction, hybrid search, and the Reflexion pattern for high-accuracy financial analytics.
 
 ## Tech Stack
-- **Frontend:** Next.js 16 (App Router), TypeScript, Tailwind CSS.
-- **Backend:** FastAPI (Python), LangGraph (Reflexion pattern).
+- **Frontend:** Next.js 16 (App Router), TypeScript, Tailwind CSS, Supabase Auth.
+- **Backend:** FastAPI (Python 3.13), LangGraph (Reflexion pattern).
 - **Database:** Supabase (Postgres, pgvector, tsvector).
-- **LLM:** Gemini 1.5 Pro/Flash (Primary), Gemini Embeddings (768 dimensions).
-- **Security:** slowapi (Rate limiting), llm-guard (Injection defense), Pydantic (Strict metadata validation).
-- **Observability:** Langfuse.
-- **Evaluation:** RAGAS.
+- **LLMs:** 
+  - **Gemini 1.5 Pro:** Primary Reasoning & Multimodal Extraction.
+  - **Groq (Llama 3.3):** High-speed Question Parsing & Contextual Retrieval.
+  - **Gemini Embeddings:** 768-dimensional dense vectors.
+- **Reranker:** FlashRank (Lightweight local cross-encoder).
+- **Encoding:** TOON (Token-Oriented Object Notation) for ultra-efficient table serialization.
+- **Security:** slowapi (Rate limiting), NativeGuard (Pydantic-based output security), Supabase Auth.
+- **Observability:** Langfuse / Agent Lightning Telemetry.
+- **Evaluation:** RAGAS (evaluated via Groq).
 
 ## Project Structure
-- `backend/`: FastAPI application, security middleware, and LangGraph services.
-- `frontend/`: Next.js 16 application with streaming chat UI.
-- `supabase/`: Database migrations including Hybrid Search RRF function.
-- `data/`: Local storage for PDF documents.
+- `backend/`: FastAPI application, middleware, and LangGraph services.
+- `frontend/`: Next.js 16 application with streaming chat UI and Google OAuth.
+- `supabase/`: Database migrations including RRF Hybrid Search and Telemetry tables.
+- `logs/`: Local rotating log files for backend monitoring.
 
 ## Key Features
-- **Multimodal 2D Extraction:** Gemini native spatial extraction for text, tables, and bounding boxes.
-- **Reflexion Orchestration:** LangGraph-based retrieval-grading-rewriting loop.
-- **Defense-in-Depth:** Rate limiting, token budgeting, and dual-layer prompt injection defense.
-- **Factual Enforcement:** Structured `AnswerWithEvidence` output validated via Guardrails AI (logic scaffolded).
-- **Coordinate Conversion:** Backend utility to map Gemini normalized boxes to frontend UI coordinates.
+- **Multimodal Layout-Aware Chunking:** Groups structural elements (headings, paragraphs, tables) using Gemini File API 2D extraction.
+- **TOON Encoding:** Reduces token usage for financial tables using Token-Oriented Object Notation.
+- **RRF + FlashRank:** Two-stage retrieval using Reciprocal Rank Fusion (Supabase) followed by local FlashRank reranking.
+- **Reflexion Orchestration:** LangGraph workflow with nodes for Question Parsing (Groq), Grading, and Rewriting.
+- **SSE Token Streaming:** True token-by-token streaming from backend to React.
+- **NativeGuard Security:** Zero-dependency Pydantic validation for structured financial outputs.
+- **Robust Monitoring:** Centralized logging with rotating file handlers and console output for production visibility.
 
 ## Setup Instructions
 
@@ -30,10 +37,9 @@ This is an agentic, enterprise-grade RAG system designed to process complex Indi
 ```bash
 cd backend
 python -m venv venv
-source venv/bin/activate
+# Activate venv
 pip install -r requirements.txt
-cp .env.example .env
-# Update .env with your GEMINI_API_KEY and DATABASE_URL
+# Update .env in root with GEMINI_API_KEY, GROQ_API_KEY, and SUPABASE credentials
 uvicorn main:app --reload
 ```
 
@@ -45,16 +51,16 @@ npm run dev
 ```
 
 ### 3. Database Setup
-Run the SQL migrations in `supabase/migrations/20240101_init.sql` against your local Supabase/Postgres instance.
+Run the SQL migrations in `supabase/migrations/20240101_init.sql` against your Supabase instance to enable pgvector, telemetry tables, and RRF functions.
 
 ## Ingestion Pipeline
-To trigger the nightly ingestion simulation:
+To trigger the layout-aware ingestion pipeline:
 ```bash
 python backend/scraper.py
 ```
 
 ## Evaluation
-To run the RAGAS evaluation pipeline:
+To run the production-ready RAGAS evaluation pipeline:
 ```bash
 python backend/eval.py
 ```
