@@ -128,67 +128,63 @@ def get_logical_boundaries(pdf_path: str) -> List[Tuple[int, int]]:
     logger.info(f"Final logical boundaries: {valid_boundaries}")
     return valid_boundaries
 
-def slice_pdf(pdf_path: str, start_page: int, end_page: int) -> str:
+def slice_and_rasterize_pdf(pdf_path: str, start_page: int, end_page: int) -> List[str]:
     """
-    Pass 2: Dynamic PDF Slicing
-    Physically slices the PDF into a temporary file.
+    Pass 2: Dynamic PDF Slicing and Rasterization
+    Slices the PDF by logical boundaries and rasterizes the pages into high-resolution images.
     """
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    temp_path = temp_file.name
-    temp_file.close()
-    
-    src = fitz.open(pdf_path)
-    dest = fitz.open()
-    dest.insert_pdf(src, from_page=start_page, to_page=end_page)
-    dest.save(temp_path)
-    dest.close()
-    src.close()
-    
-    return temp_path
+    images = []
+    doc = fitz.open(pdf_path)
+    for i in range(start_page, end_page + 1):
+        page = doc[i]
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # High resolution
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        pix.save(temp_file.name)
+        images.append(temp_file.name)
+        temp_file.close()
+    doc.close()
+    return images
 
-async def upload_to_gemini_async(path: str, mime_type: str = "application/pdf"):
+async def upload_multiple_to_gemini_async(paths: List[str], mime_type: str = "image/png"):
     """
-    Uploads a file to Gemini File API asynchronously.
+    Uploads a batch of images to Gemini File API asynchronously.
     """
-    try:
-        # genai.upload_file is synchronous, but we can wrap it or just use it as is
-        # for simplicity since it's one-off per chunk. 
-        # Actually, let's keep it simple for now as the main bottleneck is generate_content.
-        loop = asyncio.get_running_loop()
-        file = await loop.run_in_executor(None, lambda: genai.upload_file(path, mime_type=mime_type))
-        logger.info(f"Uploaded chunk '{file.display_name}' as: {file.uri}")
+    loop = asyncio.get_running_loop()
+    files = []
+    for path in paths:
+        file = await loop.run_in_executor(None, lambda p=path: genai.upload_file(p, mime_type=mime_type))
+        logger.info(f"Uploaded image '{file.display_name}' as: {file.uri}")
         
         while file.state.name == "PROCESSING":
-            await asyncio.sleep(2)
-            file = await loop.run_in_executor(None, lambda: genai.get_file(file.name))
+            await asyncio.sleep(1)
+            file = await loop.run_in_executor(None, lambda f=file.name: genai.get_file(f))
             
         if file.state.name == "FAILED":
-            raise Exception(f"File processing failed: {file.state.name}")
+            raise Exception(f"Image processing failed: {file.state.name}")
         
-        return file
-    except Exception as e:
-        logger.error(f"Failed to upload {path}: {e}")
-        raise
+        files.append(file)
+    return files
 
 async def process_section_async(pdf_path: str, start_page: int, end_page: int, semaphore: asyncio.Semaphore) -> List[StructuralElement]:
     """
-    Pass 3: Asynchronous Gemini Processing
+    Pass 3: Asynchronous Gemma 4 26B Processing
+    Passes image batches to the Gemma 4 26B API for 2D spatial extraction.
     """
     async with semaphore:
-        temp_slice = None
-        gemini_file = None
+        temp_images = []
+        gemini_files = []
         try:
-            # Slice PDF
-            temp_slice = slice_pdf(pdf_path, start_page, end_page)
+            # Slice and rasterize PDF
+            temp_images = slice_and_rasterize_pdf(pdf_path, start_page, end_page)
             
-            # Upload to Gemini
-            gemini_file = await upload_to_gemini_async(temp_slice)
+            # Upload image batches to Gemini
+            gemini_files = await upload_multiple_to_gemini_async(temp_images)
             
-            # Initialize model
-            model = genai.GenerativeModel("gemini-1.5-pro")
+            # Initialize model (Gemma 4 26B)
+            model = genai.GenerativeModel("gemma-4-26b")
             
             prompt = """
-            Extract all text and tables from the provided document section. 
+            Extract all text and tables from the provided document pages. 
             You must perform 2D spatial extraction. For every distinct block of text, paragraph, or table row, 
             you must provide its bounding box coordinates in the exact format: [ymin, xmin, ymax, xmax] 
             where coordinates are normalized and scaled from 0 to 1000.
@@ -196,8 +192,10 @@ async def process_section_async(pdf_path: str, start_page: int, end_page: int, s
             Classify each block as 'paragraph', 'table_row', or 'heading'.
             """
             
+            content_payload = [prompt] + gemini_files
+            
             response = await model.generate_content_async(
-                [prompt, gemini_file],
+                content_payload,
                 generation_config=genai.GenerationConfig(
                     response_mime_type="application/json",
                     response_schema=ExtractionOutput
@@ -210,11 +208,14 @@ async def process_section_async(pdf_path: str, start_page: int, end_page: int, s
             logger.error(f"Failed processing section {start_page}-{end_page}: {e}")
             return []
         finally:
-            if temp_slice and os.path.exists(temp_slice):
-                os.remove(temp_slice)
-            if gemini_file:
+            # Cleanup local temporary images
+            for temp_img in temp_images:
+                if os.path.exists(temp_img):
+                    os.remove(temp_img)
+            # Cleanup remote Gemini files
+            for g_file in gemini_files:
                 try:
-                    genai.delete_file(gemini_file.name)
+                    genai.delete_file(g_file.name)
                 except:
                     pass
 

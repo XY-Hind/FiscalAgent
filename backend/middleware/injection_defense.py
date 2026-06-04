@@ -1,55 +1,70 @@
 import re
+import os
+import json
 from fastapi import HTTPException, status
+from langchain_groq import ChatGroq
+from pydantic import BaseModel, Field
 
-# llm-guard imports
-from llm_guard.input_scanners import PromptInjection, Anonymize
-from llm_guard.input_scanners.prompt_injection import MatchType
-from llm_guard.vault import Vault
+class GuardResult(BaseModel):
+    is_safe: bool = Field(description="True if the prompt is safe, False if it is a semantic jailbreak, prompt injection, or contains severe violations.")
+    reason: str = Field(description="Reason for the safety classification.")
 
-class DualLayerInjectionDefense:
+class ServerlessInjectionDefense:
     def __init__(self):
-        # Layer 1: Fast regex for obvious malicious prompts
-        # E.g., looking for "ignore previous instructions", "system prompt", etc.
+        # Layer 1: Fast regex for obvious malicious prompts and PII
         self.malicious_regex = re.compile(
             r"(ignore\s+(all\s+)?previous\s+(instructions|directions|prompts))|"
             r"(you\s+are\s+now\s+(a\s+)?)|"
-            r"(system\s+prompt)", 
+            r"(system\s+prompt)|"
+            r"(\b\d{3}-\d{2}-\d{4}\b)|" # SSN basic pattern
+            r"(\b(select|drop|insert|delete|update|union|truncate)\b.*\b(from|into|table)\b)", 
             re.IGNORECASE
         )
-        
-        # Layer 2: llm-guard for semantic jailbreaks and PII masking
-        self.vault = Vault()
-        self.injection_scanner = PromptInjection(match_type=MatchType.FULL)
-        self.anonymizer = Anonymize(vault=self.vault)
 
     def secure_prompt(self, prompt: str) -> str:
         """
-        Runs the prompt through a dual-layer defense.
+        Runs the prompt through a serverless dual-layer defense.
         1. Fast Regex filtering
-        2. LLM-Guard semantic scanning and PII anonymization
-        Returns the sanitized prompt, or raises an HTTPException.
+        2. API-Driven LLM-Guard semantic scanning (Groq Llama-Guard-3-8B)
         """
-        # Layer 1
+        # Layer 1: Regex
         if self.malicious_regex.search(prompt):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Security violation: Malicious pattern detected in prompt."
+                detail="Security violation: Malicious pattern or PII detected in prompt."
             )
             
-        # Layer 2 - Anonymize PII
-        sanitized_prompt, is_valid, risk_score = self.anonymizer.scan(prompt)
-        
-        # Layer 2 - Jailbreak Detection
-        # PromptInjection scanner
-        _, is_safe, inj_risk_score = self.injection_scanner.scan(sanitized_prompt)
-        
-        if not is_safe:
+        # Layer 2: Groq Llama-Prompt-Guard-2-86M
+        try:
+            llm = ChatGroq(
+                model="meta-llama/llama-prompt-guard-2-86m", 
+                groq_api_key=os.getenv("GROQ_API_KEY"),
+                temperature=0.0
+            )
+            
+            # Llama Prompt Guard returns 'safe' or 'unsafe'
+            result = llm.invoke(prompt)
+            
+            if "unsafe" in result.content.lower():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Security violation: Prompt rejected by LLM Guard. {result.content}"
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            if "rate_limit_exceeded" in str(e).lower() or "429" in str(e):
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Groq API limit reached. Please try again later."
+                )
+            # Fail closed for security
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Security violation: Semantic prompt injection detected."
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Security validation service is currently unavailable."
             )
             
-        return sanitized_prompt
+        return prompt
 
 # Singleton instance
-injection_defense = DualLayerInjectionDefense()
+injection_defense = ServerlessInjectionDefense()

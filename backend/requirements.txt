@@ -11,10 +11,11 @@ langgraph
 langgraph-checkpoint-postgres
 psycopg[binary]
 slowapi
-llm-guard
 flashrank
 langfuse
 ragas
 apscheduler
 python-dotenv
+pymupdf
+
 pymupdf

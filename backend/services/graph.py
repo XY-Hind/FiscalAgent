@@ -2,7 +2,7 @@ import os
 import operator
 from typing import Annotated, Sequence, TypedDict, Any, List
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI, HarmCategory, HarmBlockThreshold
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
@@ -20,6 +20,14 @@ supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and
 
 # Initialize FlashRank (lightweight local reranker)
 ranker = Ranker()
+
+# Standard Safety Settings for Google GenAI Models
+DEFAULT_SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+}
 
 # -----------------
 # 1. State Definition
@@ -44,32 +52,38 @@ class QueryFilters(BaseModel):
 
 def parse_query(state: GraphState):
     """
-    Uses Groq API to parse the user question into optimized keywords and strict metadata filters.
+    Uses Groq API (Llama-3.1-8B-Instant) to parse the user question into optimized keywords and strict metadata filters.
     """
     logger.info("Parsing user query for metadata extraction...")
-    llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
-        groq_api_key=os.getenv("GROQ_API_KEY"),
-        temperature=0
-    )
-    user_message = state["messages"][-1].content
-    
-    llm_with_tool = llm.with_structured_output(QueryFilters)
-    prompt = (
-        f"You are a financial query parser. Analyze this user query and extract an optimized search query "
-        f"and any explicit metadata filters (company, year, section, gstin).\n\n"
-        f"Query: {user_message}"
-    )
-    
     try:
+        llm = ChatGroq(
+            model="llama-3.1-8b-instant",
+            groq_api_key=os.getenv("GROQ_API_KEY"),
+            temperature=0
+        )
+        user_message = state["messages"][-1].content
+        
+        llm_with_tool = llm.with_structured_output(QueryFilters)
+        prompt = (
+            f"You are a financial query parser. Analyze this user query and extract an optimized search query "
+            f"and any explicit metadata filters (company, year, section, gstin).\n\n"
+            f"Query: {user_message}"
+        )
+        
         parsed = llm_with_tool.invoke(prompt)
         optimized_query = parsed.optimized_query
         filters = parsed.metadata_filters
         logger.info(f"Extracted filters: {filters}")
     except Exception as e:
-        logger.error(f"Query parsing failed: {e}")
-        optimized_query = user_message
-        filters = {}
+        if "rate_limit_exceeded" in str(e).lower() or "429" in str(e):
+            logger.error("Groq API limit reached during query parsing.")
+            # Standard error message for UI to catch
+            optimized_query = "ERROR_API_LIMIT_REACHED: Groq"
+            filters = {}
+        else:
+            logger.error(f"Query parsing failed: {e}")
+            optimized_query = state["messages"][-1].content
+            filters = {}
     
     return {
         "query": optimized_query, 
@@ -83,6 +97,10 @@ def retrieve(state: GraphState):
     """
     query = state["query"]
     filters = state["metadata_filters"]
+    
+    if "ERROR_API_LIMIT_REACHED" in query:
+        return {"retrieved_docs": [], "retrieved_context": query}
+
     logger.info(f"Retrieving chunks for query: '{query}' with filters: {filters}")
     
     if not supabase:
@@ -95,12 +113,11 @@ def retrieve(state: GraphState):
     try:
         query_embedding = embeddings_model.embed_query(query)
         
-        # Call RRF RPC function
         response = supabase.rpc("match_chunks_rrf", {
             "query_text": query,
             "query_embedding": query_embedding,
             "metadata_filter": filters,
-            "match_count": 25, # Retrieve slightly more for reranking
+            "match_count": 25,
             "rrf_k": 60
         }).execute()
         
@@ -109,6 +126,9 @@ def retrieve(state: GraphState):
         return {"retrieved_docs": docs}
             
     except Exception as e:
+        if "429" in str(e) or "quota" in str(e).lower():
+            logger.error("Gemini API limit reached during retrieval (embedding).")
+            return {"retrieved_docs": [], "retrieved_context": "ERROR_API_LIMIT_REACHED: Gemini"}
         logger.error(f"Supabase retrieval failed: {e}")
         return {"retrieved_docs": [], "retrieved_context": f"Error during retrieval: {str(e)}"}
 
@@ -118,6 +138,10 @@ def rerank(state: GraphState):
     """
     query = state["query"]
     docs = state["retrieved_docs"]
+    context = state.get("retrieved_context", "")
+    
+    if "ERROR_API_LIMIT_REACHED" in context:
+        return {"retrieved_context": context}
     
     if not docs:
         logger.warning("No documents to rerank.")
@@ -126,7 +150,6 @@ def rerank(state: GraphState):
     logger.info(f"Reranking {len(docs)} documents using FlashRank...")
     
     try:
-        # Prepare passages for FlashRank
         passages = []
         for doc in docs:
             passages.append({
@@ -138,15 +161,12 @@ def rerank(state: GraphState):
                 }
             })
         
-        # Execute Reranking
         rerank_request = RerankRequest(query=query, passages=passages)
         reranked_results = ranker.rerank(rerank_request)
         
-        # Take top 10 after reranking
         top_results = reranked_results[:10]
         logger.info(f"Reranking complete. Top score: {top_results[0].get('score') if top_results else 'N/A'}")
         
-        # Format context pieces
         context_pieces = []
         for res in top_results:
             meta = res.get("meta", {})
@@ -160,7 +180,6 @@ def rerank(state: GraphState):
         return {"retrieved_context": retrieved_context}
     except Exception as e:
         logger.error(f"FlashRank reranking failed: {e}")
-        # Fallback to top retrieved docs without reranking
         return {"retrieved_context": "\n\n---\n\n".join([d.get("content") for d in docs[:10]])}
 
 class Grade(BaseModel):
@@ -168,34 +187,54 @@ class Grade(BaseModel):
 
 def grade_context(state: GraphState):
     """
-    Explicitly grade the context for relevance.
+    Explicitly grade the context for relevance using Gemma 4 31B.
     """
+    if "ERROR_API_LIMIT_REACHED" in state["retrieved_context"]:
+        return {"context_is_relevant": True} # Bypass to generate_answer to show error
+
     logger.info("Grading retrieved context relevance...")
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
-    llm_with_tool = llm.with_structured_output(Grade)
-    
-    prompt = f"Does the following context answer the user query?\nQuery: {state['query']}\nContext: {state['retrieved_context']}"
     try:
+        llm = ChatGoogleGenerativeAI(
+            model="gemma-4-31b", 
+            temperature=0, 
+            safety_settings=DEFAULT_SAFETY_SETTINGS
+        )
+        llm_with_tool = llm.with_structured_output(Grade)
+        
+        prompt = f"Does the following context answer the user query?\nQuery: {state['query']}\nContext: {state['retrieved_context']}"
         result = llm_with_tool.invoke(prompt)
         is_relevant = result.is_relevant
         logger.info(f"Context relevance grade: {is_relevant}")
     except Exception as e:
+        if "429" in str(e) or "quota" in str(e).lower():
+            logger.error("Gemini API limit reached during context grading.")
+            return {"retrieved_context": "ERROR_API_LIMIT_REACHED: Gemini", "context_is_relevant": True}
         logger.error(f"Context grading failed: {e}")
-        is_relevant = True # Fallback
+        is_relevant = True
     
     return {"context_is_relevant": is_relevant}
 
 def reflect_and_rewrite(state: GraphState):
     """
-    If context is poor, reflect on the failure and rewrite the query.
+    If context is poor, reflect on the failure and rewrite the query using Gemma 4 31B.
     """
     logger.info(f"Context irrelevant. Rewriting query (Attempt {state['reflection_attempts'] + 1})...")
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0)
-    prompt = f"The previous query '{state['query']}' did not retrieve relevant context. Rewrite it to be more specific or use different keywords."
-    result = llm.invoke(prompt)
-    
-    new_query = result.content.strip()
-    logger.info(f"New optimized query: '{new_query}'")
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model="gemma-4-31b", 
+            temperature=0, 
+            safety_settings=DEFAULT_SAFETY_SETTINGS
+        )
+        prompt = f"The previous query '{state['query']}' did not retrieve relevant context. Rewrite it to be more specific or use different keywords."
+        result = llm.invoke(prompt)
+        new_query = result.content.strip()
+        logger.info(f"New optimized query: '{new_query}'")
+    except Exception as e:
+        if "429" in str(e) or "quota" in str(e).lower():
+            logger.error("Gemini API limit reached during query rewrite.")
+            new_query = "ERROR_API_LIMIT_REACHED: Gemini"
+        else:
+            new_query = state["query"]
     
     return {
         "query": new_query,
@@ -204,18 +243,34 @@ def reflect_and_rewrite(state: GraphState):
 
 def generate_answer(state: GraphState):
     """
-    Generate structured output based on context, validated.
+    Generate structured output based on context using Gemma 4 31B, validated.
     """
+    context = state["retrieved_context"]
+    
+    # Handle API Limit propagation
+    if "ERROR_API_LIMIT_REACHED" in context:
+        provider = context.split(": ")[1]
+        final_output = AnswerWithEvidence(
+            answer=f"⚠️ {provider} API limit reached. Please wait a moment and try again.", 
+            reasoning=f"The ingestion/generation pipeline hit the rate limit for {provider}.", 
+            citations=[]
+        )
+        return {"final_output": final_output}
+
     logger.info("Generating final answer with evidence...")
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0, streaming=True)
-    llm_with_schema = llm.with_structured_output(AnswerWithEvidence)
-    
-    prompt = f"Answer the query based ONLY on the context. Provide exact quotes and bounding boxes if present in the context.\nQuery: {state['query']}\nContext: {state['retrieved_context']}"
-    
     try:
+        llm = ChatGoogleGenerativeAI(
+            model="gemma-4-31b", 
+            temperature=0, 
+            streaming=True, 
+            safety_settings=DEFAULT_SAFETY_SETTINGS
+        )
+        llm_with_schema = llm.with_structured_output(AnswerWithEvidence)
+        
+        prompt = f"Answer the query based ONLY on the context. Provide exact quotes and bounding boxes if present in the context.\nQuery: {state['query']}\nContext: {context}"
+        
         result = llm_with_schema.invoke(prompt)
         
-        # Output Security Integration
         guard_result = output_guard.validate(result.model_dump())
         if guard_result.validation_passed:
             final_output = AnswerWithEvidence(**guard_result.validated_output)
@@ -224,8 +279,16 @@ def generate_answer(state: GraphState):
             logger.warning("Final answer failed validation. Returning raw output.")
             final_output = result
     except Exception as e:
-        logger.error(f"Answer generation failed: {e}")
-        final_output = AnswerWithEvidence(answer=f"Error generating answer: {str(e)}", reasoning="", citations=[])
+        if "429" in str(e) or "quota" in str(e).lower():
+            logger.error("Gemini API limit reached during answer generation.")
+            final_output = AnswerWithEvidence(
+                answer="⚠️ Gemini API limit reached. Please wait a moment and try again.", 
+                reasoning="Rate limit hit during final synthesis.", 
+                citations=[]
+            )
+        else:
+            logger.error(f"Answer generation failed: {e}")
+            final_output = AnswerWithEvidence(answer=f"Error generating answer: {str(e)}", reasoning="", citations=[])
     
     return {"final_output": final_output}
 
