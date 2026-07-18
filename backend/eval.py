@@ -14,7 +14,7 @@ async def run_real_pipeline(question: str):
     """
     Executes the actual RAG pipeline for evaluation.
     """
-    config = {"configurable": {"thread_id": "eval-session"}}
+    config = {"configurable": {"thread_id": "eval-session"}, "recursion_limit": 10}
     input_state = {"messages": [("user", question)]}
     
     # We call the real graph here

@@ -17,5 +17,3 @@ ragas
 apscheduler
 python-dotenv
 pymupdf
-
-pymupdf

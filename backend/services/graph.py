@@ -41,6 +41,7 @@ class GraphState(TypedDict):
     context_is_relevant: bool
     final_output: AnswerWithEvidence | None
     reflection_attempts: int
+    retry_count: int
 
 # -----------------
 # 2. Nodes
@@ -189,8 +190,10 @@ def grade_context(state: GraphState):
     """
     Explicitly grade the context for relevance using Gemma 4 31B.
     """
+    retry_count = state.get("retry_count", 0) + 1
+
     if "ERROR_API_LIMIT_REACHED" in state["retrieved_context"]:
-        return {"context_is_relevant": True} # Bypass to generate_answer to show error
+        return {"context_is_relevant": True, "retry_count": retry_count} # Bypass to generate_answer to show error
 
     logger.info("Grading retrieved context relevance...")
     try:
@@ -208,11 +211,11 @@ def grade_context(state: GraphState):
     except Exception as e:
         if "429" in str(e) or "quota" in str(e).lower():
             logger.error("Gemini API limit reached during context grading.")
-            return {"retrieved_context": "ERROR_API_LIMIT_REACHED: Gemini", "context_is_relevant": True}
+            return {"retrieved_context": "ERROR_API_LIMIT_REACHED: Gemini", "context_is_relevant": True, "retry_count": retry_count}
         logger.error(f"Context grading failed: {e}")
         is_relevant = True
     
-    return {"context_is_relevant": is_relevant}
+    return {"context_is_relevant": is_relevant, "retry_count": retry_count}
 
 def reflect_and_rewrite(state: GraphState):
     """
@@ -299,9 +302,21 @@ def generate_answer(state: GraphState):
 def decide_next_step(state: GraphState):
     if state["context_is_relevant"]:
         return "generate_answer"
-    if state["reflection_attempts"] >= 3:
-        return "generate_answer" # Fallback, try best effort
+    if state.get("retry_count", 0) >= 3:
+        return "fallback_node"
     return "reflect_and_rewrite"
+
+def fallback_node(state: GraphState):
+    """
+    Fallback node when maximum retries are reached.
+    """
+    logger.warning("Max retry count reached. Returning fallback response.")
+    final_output = AnswerWithEvidence(
+        answer="I cannot find the exact answer in the provided documents.",
+        reasoning="Max retry count reached and no relevant context found.",
+        citations=[]
+    )
+    return {"final_output": final_output}
 
 workflow = StateGraph(GraphState)
 
@@ -311,6 +326,7 @@ workflow.add_node("rerank", rerank)
 workflow.add_node("grade_context", grade_context)
 workflow.add_node("reflect_and_rewrite", reflect_and_rewrite)
 workflow.add_node("generate_answer", generate_answer)
+workflow.add_node("fallback_node", fallback_node)
 
 workflow.set_entry_point("parse_query")
 workflow.add_edge("parse_query", "retrieve")
@@ -319,6 +335,7 @@ workflow.add_edge("rerank", "grade_context")
 workflow.add_conditional_edges("grade_context", decide_next_step)
 workflow.add_edge("reflect_and_rewrite", "retrieve")
 workflow.add_edge("generate_answer", END)
+workflow.add_edge("fallback_node", END)
 
 # Compile graph
 rag_agent = workflow.compile()

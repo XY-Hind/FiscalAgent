@@ -1,6 +1,7 @@
 import json
 import asyncio
 from typing import AsyncGenerator
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -36,7 +37,7 @@ async def generate_chat_stream(request: ChatRequest, checkpointer) -> AsyncGener
         return
     
     # 2. Prepare Graph State
-    config = {"configurable": {"thread_id": request.session_id}, "checkpointer": checkpointer}
+    config = {"configurable": {"thread_id": request.session_id}, "checkpointer": checkpointer, "recursion_limit": 10}
     input_state = {
         "messages": [HumanMessage(content=secured_prompt)]
     }
