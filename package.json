@@ -1,6 +1,6 @@
 {
   "devDependencies": {
-    "supabase": "^2.104.0"
+    "supabase": "^2.109.1"
   },
   "dependencies": {
     "@toon-format/toon": "^2.3.0"
