@@ -23,10 +23,7 @@ DB_URI = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:543
 async def lifespan(app: FastAPI):
     # Initialize the LangGraph Postgres Checkpointer
     try:
-        # psycopg.AsyncConnection.connect is a coroutine; must be awaited
-        conn = await psycopg.AsyncConnection.connect(DB_URI)
-        async with conn:
-            checkpointer = AsyncPostgresSaver(conn)
+        async with AsyncPostgresSaver.from_conn_string(DB_URI) as checkpointer:
             # As explicitly required in Phase 1: call the async .setup() method
             await checkpointer.setup()
             logger.info("LangGraph Postgres Checkpointer setup complete.")
