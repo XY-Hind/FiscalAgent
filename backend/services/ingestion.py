@@ -22,9 +22,10 @@ class StructuralElement(BaseModel):
 
 def get_gemini_embeddings_model():
     return GoogleGenerativeAIEmbeddings(
-        model="models/text-embedding-004",
+        model="models/gemini-embedding-2",
         google_api_key=os.getenv("GEMINI_API_KEY"),
-        task_type="retrieval_document"
+        task_type="retrieval_document",
+        output_dimensionality=768
     )
 
 # 1. Global LLM Initialization to reuse the connection pool
@@ -153,16 +154,8 @@ def process_structural_elements(document_title: str, elements: List[StructuralEl
 
     # Run asynchronous context generation concurrently
     logger.info("Generating contextual summaries concurrently via Groq...")
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    if loop.is_running():
-        import nest_asyncio
-        nest_asyncio.apply()
-        
+    # Since upload_document is synchronous, it runs in a FastAPI threadpool without an active event loop.
+    # Therefore, we can safely use asyncio.run to execute the async context generation block.
     context_strings = asyncio.run(_async_batch_generate_context(document_title, encoded_texts))
 
     # Recombine the concurrent results
@@ -180,7 +173,7 @@ def process_structural_elements(document_title: str, elements: List[StructuralEl
         })
         enriched_texts.append(enriched_text)
 
-    logger.info("Batch generating embeddings using Gemini Embedding 2 (text-embedding-004)...")
+    logger.info("Batch generating embeddings using Gemini Embedding 2 (gemini-embedding-2)...")
     batch_size = 100
     
     for i in range(0, len(enriched_texts), batch_size):

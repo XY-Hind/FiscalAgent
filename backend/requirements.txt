@@ -17,3 +17,4 @@ ragas
 apscheduler
 python-dotenv
 pymupdf
+python-multipart

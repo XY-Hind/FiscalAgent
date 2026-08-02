@@ -18,6 +18,7 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+    document_id: str | None = None
 
 @observe()
 async def generate_chat_stream(request: ChatRequest, checkpointer) -> AsyncGenerator[str, None]:
@@ -38,8 +39,21 @@ async def generate_chat_stream(request: ChatRequest, checkpointer) -> AsyncGener
     
     # 2. Prepare Graph State
     config = {"configurable": {"thread_id": request.session_id}, "checkpointer": checkpointer, "recursion_limit": 10}
+    
+    # Session Locking Logic: enforce the active_document_id if the thread already has one
+    try:
+        existing_state = await checkpointer.aget(config)
+        if existing_state and hasattr(existing_state, "values"):
+            locked_doc_id = existing_state.values.get("active_document_id")
+            if locked_doc_id and request.document_id and request.document_id != locked_doc_id:
+                logger.warning(f"Session {request.session_id} is locked to doc {locked_doc_id}. Ignoring UI doc {request.document_id}.")
+            request.document_id = locked_doc_id
+    except Exception as e:
+        logger.warning(f"Could not fetch existing state for session {request.session_id}: {e}")
+
     input_state = {
-        "messages": [HumanMessage(content=secured_prompt)]
+        "messages": [HumanMessage(content=secured_prompt)],
+        "active_document_id": request.document_id
     }
     
     # 3. Stream LangGraph execution

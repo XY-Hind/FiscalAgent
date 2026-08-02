@@ -36,6 +36,7 @@ class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     query: str
     metadata_filters: dict
+    active_document_id: str | None
     retrieved_docs: List[dict]
     retrieved_context: str
     context_is_relevant: bool
@@ -119,7 +120,8 @@ def retrieve(state: GraphState):
             "query_embedding": query_embedding,
             "metadata_filter": filters,
             "match_count": 25,
-            "rrf_k": 60
+            "rrf_k": 60,
+            "filter_document_id": state.get("active_document_id")
         }).execute()
         
         docs = response.data or []

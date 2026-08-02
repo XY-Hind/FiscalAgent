@@ -12,6 +12,7 @@ import psycopg
 from dotenv import load_dotenv
 
 from backend.api.chat import router as chat_router
+from backend.api.documents import router as documents_router
 from backend.middleware.rate_limit import setup_rate_limiting
 from backend.utils.logger import logger
 
@@ -52,6 +53,7 @@ app.add_middleware(
 )
 
 app.include_router(chat_router, prefix="/api/v1")
+app.include_router(documents_router, prefix="/api/v1")
 
 @app.get("/health")
 async def health_check():

@@ -56,7 +56,7 @@ async def main():
     
     # Groq as evaluator for speed/cost
     evaluator_llm = ChatGroq(model="llama-3.3-70b-versatile", groq_api_key=os.getenv("GROQ_API_KEY"))
-    evaluator_embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    evaluator_embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-2")
     
     # Evaluation
     # try:
