@@ -6,7 +6,10 @@ CREATE TABLE documents (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   title TEXT NOT NULL,
   gstin TEXT,
-  fiscal_date DATE,
+  fiscal_year INT,
+  company_name TEXT,
+  file_name TEXT,
+  is_preloaded BOOLEAN DEFAULT false,
   metadata JSONB,
   created_at TIMESTAMPTZ DEFAULT now()
 );
@@ -21,6 +24,11 @@ CREATE TABLE document_chunks (
   bounding_boxes JSONB,
   -- Structural path metadata (Company > Year > Section)
   path_metadata JSONB,
+  -- Redundant metadata for easy filtering 
+  company_name TEXT,
+  fiscal_year INT,
+  file_name TEXT,
+  is_preloaded BOOLEAN DEFAULT false,
   -- Dense embedding (768 dimensions for Gemini)
   embedding VECTOR(768),
   -- Sparse index
@@ -52,7 +60,8 @@ CREATE OR REPLACE FUNCTION match_chunks_rrf(
   query_embedding VECTOR(768),
   metadata_filter JSONB DEFAULT '{}'::jsonb,
   match_count INT DEFAULT 20,
-  rrf_k INT DEFAULT 60
+  rrf_k INT DEFAULT 60,
+  filter_document_id UUID DEFAULT NULL
 )
 RETURNS TABLE (
   chunk_id UUID,
@@ -72,7 +81,8 @@ BEGIN
       id,
       ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank
     FROM document_chunks
-    WHERE path_metadata @> metadata_filter OR metadata_filter = '{}'::jsonb
+    WHERE (path_metadata @> metadata_filter OR metadata_filter = '{}'::jsonb)
+      AND (filter_document_id IS NULL OR document_chunks.document_id = filter_document_id)
     ORDER BY embedding <=> query_embedding
     LIMIT match_count
   ),
@@ -83,6 +93,7 @@ BEGIN
     FROM document_chunks
     WHERE fts @@ plainto_tsquery('english', query_text)
       AND (path_metadata @> metadata_filter OR metadata_filter = '{}'::jsonb)
+      AND (filter_document_id IS NULL OR document_chunks.document_id = filter_document_id)
     ORDER BY ts_rank_cd(fts, plainto_tsquery('english', query_text)) DESC
     LIMIT match_count
   ),
