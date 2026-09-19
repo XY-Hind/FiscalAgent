@@ -24,8 +24,13 @@ load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Initialize Supabase client
-supabase_url = os.getenv("SUPABASE_URL", "")
-supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+supabase_url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")
+supabase_key = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("NEXT_PUBLIC_SUPABASE_SECRET_KEY")
+    or os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")
+    or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY", "")
+)
 supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
 
 class ExtractionOutput(BaseModel):

@@ -8,14 +8,22 @@ from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from flashrank import Ranker, RerankRequest
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from backend.models.output import AnswerWithEvidence
 from backend.models.validation import output_guard
 from backend.utils.logger import logger
 
 # Initialize Supabase client
-supabase_url = os.environ.get("SUPABASE_URL", "")
-supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+supabase_url = os.environ.get("SUPABASE_URL") or os.environ.get("NEXT_PUBLIC_SUPABASE_URL", "")
+supabase_key = (
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    or os.environ.get("NEXT_PUBLIC_SUPABASE_SECRET_KEY")
+    or os.environ.get("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")
+    or os.environ.get("NEXT_PUBLIC_SUPABASE_ANON_KEY", "")
+)
 supabase: Client = create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
 
 # Initialize FlashRank (lightweight local reranker)

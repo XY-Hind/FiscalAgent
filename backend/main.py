@@ -8,21 +8,34 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.memory import MemorySaver
 import psycopg
 from dotenv import load_dotenv
+
+# Load environment variables before importing modules that depend on them
+load_dotenv()
 
 from backend.api.chat import router as chat_router
 from backend.api.documents import router as documents_router
 from backend.middleware.rate_limit import setup_rate_limiting
 from backend.utils.logger import logger
 
-load_dotenv()
-
 DB_URI = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize the LangGraph Postgres Checkpointer
+    # Initialize the LangGraph Checkpointer
+    if "[YOUR-PASSWORD]" in DB_URI or not DB_URI:
+        logger.warning(
+            "DATABASE_URL contains placeholder '[YOUR-PASSWORD]' or is empty. "
+            "Falling back to in-memory checkpointer (MemorySaver). "
+            "To persist LangGraph state to Supabase Cloud Postgres, update [YOUR-PASSWORD] in .env."
+        )
+        app.state.checkpointer = MemorySaver()
+        yield
+        logger.info("Shutting down...")
+        return
+
     try:
         async with AsyncPostgresSaver.from_conn_string(DB_URI) as checkpointer:
             # As explicitly required in Phase 1: call the async .setup() method
@@ -35,8 +48,11 @@ async def lifespan(app: FastAPI):
             yield
             logger.info("Shutting down...")
     except Exception as e:
-        logger.error(f"Failed to initialize checkpointer: {e}")
-        raise
+        logger.error(f"Failed to initialize Postgres checkpointer: {e}")
+        logger.warning("Falling back to MemorySaver so API remains operational. Please check your Supabase Cloud DATABASE_URL in .env.")
+        app.state.checkpointer = MemorySaver()
+        yield
+        logger.info("Shutting down...")
 
 app = FastAPI(title="MultiModal RAG API", lifespan=lifespan)
 

@@ -6,9 +6,8 @@ import { createBrowserClient } from "@supabase/ssr";
 export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   
-  // In a real application, replace these with actual env vars
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "http://localhost:54321";
-  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "dummy-key";
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "https://ndlkqcwjwfcwgectcuno.supabase.co";
+  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || "dummy-key";
   
   const supabase = createBrowserClient(supabaseUrl, supabaseKey);
 
