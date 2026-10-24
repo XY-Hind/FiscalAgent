@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import asyncio
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
@@ -174,30 +175,53 @@ def process_structural_elements(document_title: str, elements: List[StructuralEl
         enriched_texts.append(enriched_text)
 
     logger.info("Batch generating embeddings using Gemini Embedding 2 (gemini-embedding-2)...")
-    batch_size = 100
-    
+    batch_size = 20
+    batch_delay_seconds = 2.0
+    max_retries = 5
+    total_batches = (len(enriched_texts) + batch_size - 1) // batch_size
+
     for i in range(0, len(enriched_texts), batch_size):
+        batch_num = (i // batch_size) + 1
         batch_texts = enriched_texts[i:i + batch_size]
-        try:
-            vectors = embeddings_model.embed_documents(batch_texts)
-            
-            for j, vector in enumerate(vectors):
-                chunk_data = pending_chunks[i + j]
-                results.append(
-                    ChunkResult(
-                        text=chunk_data["text"],
-                        context_string=chunk_data["context_string"],
-                        embedding=vector,
-                        path_metadata=path_metadata,
-                        bounding_boxes=chunk_data["bounding_boxes"]
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                vectors = embeddings_model.embed_documents(batch_texts)
+
+                for j, vector in enumerate(vectors):
+                    chunk_data = pending_chunks[i + j]
+                    results.append(
+                        ChunkResult(
+                            text=chunk_data["text"],
+                            context_string=chunk_data["context_string"],
+                            embedding=vector,
+                            path_metadata=path_metadata,
+                            bounding_boxes=chunk_data["bounding_boxes"]
+                        )
                     )
-                )
-            logger.info(f"Embedded batch {i // batch_size + 1}")
-        except Exception as e:
-            if "429" in str(e) or "quota" in str(e).lower():
-                logger.error(f"Gemini API limit reached during embedding generation for batch {i // batch_size + 1}.")
+                logger.info(f"Embedded batch {batch_num}/{total_batches} ({len(batch_texts)} chunks)")
                 break
-            logger.error(f"Failed to generate embeddings for batch {i // batch_size + 1}: {e}")
+
+            except Exception as e:
+                error_str = str(e).lower()
+                if "429" in error_str or "quota" in error_str or "resource_exhausted" in error_str or "rate" in error_str:
+                    if attempt < max_retries:
+                        wait_time = 15 * attempt
+                        logger.warning(
+                            f"Gemini rate limit hit on batch {batch_num}/{total_batches} "
+                            f"(attempt {attempt}/{max_retries}). Waiting {wait_time}s before retry..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"Gemini API limit reached after {max_retries} retries on batch {batch_num}.")
+                else:
+                    logger.error(f"Failed to generate embeddings for batch {batch_num}: {e}")
+                break
+
+        # Add delay between batches to prevent hitting RPM/TPM rate limits
+        if batch_num < total_batches:
+            time.sleep(batch_delay_seconds)
 
     logger.info(f"Successfully processed {len(results)} chunks for '{document_title}'")
     return results

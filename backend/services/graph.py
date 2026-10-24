@@ -65,6 +65,7 @@ def parse_query(state: GraphState):
     Uses Groq API (qwen/qwen3.8-27b) to parse the user question into optimized keywords and strict metadata filters.
     """
     logger.info("Parsing user query for metadata extraction...")
+    active_doc_id = state.get("active_document_id")
     try:
         llm = ChatGroq(
             model="qwen/qwen3.8-27b",
@@ -73,17 +74,18 @@ def parse_query(state: GraphState):
         )
         user_message = state["messages"][-1].content
         
+        doc_context = f"\nLocked Document Context:\n- Document ID: {active_doc_id}\n" if active_doc_id else ""
         llm_with_tool = llm.with_structured_output(QueryFilters)
         prompt = (
             f"You are a financial query parser. Analyze this user query and extract an optimized search query "
-            f"and any explicit metadata filters (company, year, section, gstin).\n\n"
+            f"and any explicit metadata filters (company, year, section, gstin).{doc_context}\n\n"
             f"Query: {user_message}"
         )
         
         parsed = llm_with_tool.invoke(prompt)
         optimized_query = parsed.optimized_query
         filters = parsed.metadata_filters
-        logger.info(f"Extracted filters: {filters}")
+        logger.info(f"Extracted filters: {filters} (active_document_id: {active_doc_id})")
     except Exception as e:
         if "rate_limit_exceeded" in str(e).lower() or "429" in str(e):
             logger.error("Groq API limit reached during query parsing.")
@@ -98,6 +100,7 @@ def parse_query(state: GraphState):
     return {
         "query": optimized_query, 
         "metadata_filters": filters,
+        "active_document_id": active_doc_id,
         "reflection_attempts": state.get("reflection_attempts", 0)
     }
 
