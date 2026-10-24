@@ -31,7 +31,7 @@ def get_gemini_embeddings_model():
 # 1. Global LLM Initialization to reuse the connection pool
 try:
     groq_llm = ChatGroq(
-        model="llama-3.1-8b-instant", 
+        model="qwen/qwen3.8-27b", 
         groq_api_key=os.getenv("GROQ_API_KEY")
     )
 except Exception as e:

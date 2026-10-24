@@ -25,7 +25,7 @@ class ServerlessInjectionDefense:
         """
         Runs the prompt through a serverless dual-layer defense.
         1. Fast Regex filtering
-        2. API-Driven LLM-Guard semantic scanning (Groq Llama-Guard-3-8B)
+        2. API-Driven LLM-Guard semantic scanning (Groq meta-llama/llama-prompt-guard-2-86m)
         """
         # Layer 1: Regex
         if self.malicious_regex.search(prompt):

@@ -13,13 +13,13 @@ An agentic, enterprise-grade RAG system for processing complex corporate annual 
 | **Database** | Supabase — Postgres, `pgvector` (HNSW), `tsvector` (GIN) |
 | **PDF Parsing** | PyMuPDF (`fitz`) — TOC/font-heuristic boundary detection, page rasterization |
 | **Extraction LLM** | Gemma 4 26B (`google-generativeai`) — 2D spatial extraction via Gemini File API |
-| **Query Parsing** | Groq / `llama-3.1-8b-instant` — structured metadata + query rewrite |
+| **Query Parsing** | Groq / `qwen/qwen3.8-27b` — structured metadata + query rewrite |
 | **Reasoning LLM** | Gemma 4 31B (`langchain-google-genai`) — context grading, query rewriting, answer generation |
 | **Embeddings** | `gemini-embedding-2` — 768-dim dense vectors (task-typed) |
 | **Reranker** | FlashRank — lightweight local cross-encoder (top-10 of 25 retrieved) |
 | **Table Encoding** | TOON (Text-Oriented Object Notation) — pipe-delimited row serialization for LLM tokens |
 | **Output Validation** | NativeGuard — zero-dependency Pydantic validator (`AnswerWithEvidence`) |
-| **Security** | slowapi (rate limiting), injection defense middleware, token budget middleware |
+| **Security** | slowapi (rate limiting), injection defense middleware (`meta-llama/llama-prompt-guard-2-86m`), token budget middleware |
 | **Observability** | Langfuse (`@observe`) — traces every chat generation |
 | **Evaluation** | RAGAS pipeline (`eval.py`) |
 | **Checkpointing** | LangGraph `AsyncPostgresSaver` — persistent multi-turn session state in Postgres |
@@ -83,7 +83,7 @@ FiscalAgent/
 ### Chunking & Embedding (`ingestion.py`)
 1. **Layout-Aware Grouping** — Elements are grouped by structural type. A heading starts a new chunk when the current group exceeds 2 elements; groups are capped at 15. Table splits reinject the last header row.
 2. **TOON Encoding** — `table_row` elements are serialized via `encode_to_toon_table()` into pipe-delimited TOON format; paragraphs and headings are prefixed with their type labels.
-3. **Contextual Retrieval (Groq)** — Groq `llama-3.1-8b-instant` generates a 1–2 sentence contextual summary per chunk, concurrent under a rate-limit semaphore with exponential backoff (20s, 40s).
+3. **Contextual Retrieval (Groq)** — Groq `qwen/qwen3.8-27b` generates a 1–2 sentence contextual summary per chunk, concurrent under a rate-limit semaphore with exponential backoff (20s, 40s).
 4. **Batch Embedding** — `gemini-embedding-2` embeds `"Context: <summary>\n\n<chunk>"` strings in batches of 100, producing 768-dim vectors.
 5. **Persistence** — Document record and all chunks (`content`, `context_string`, `embedding`, `bounding_boxes`, `path_metadata`) are batch-inserted into Supabase.
 
@@ -103,7 +103,7 @@ parse_query → retrieve → rerank → grade_context
 
 | Node | Model | Role |
 |---|---|---|
-| `parse_query` | Groq `llama-3.1-8b-instant` | Extracts `optimized_query` + `metadata_filters` (company, year, section, gstin) via structured output |
+| `parse_query` | Groq `qwen/qwen3.8-27b` | Extracts `optimized_query` + `metadata_filters` (company, year, section, gstin) via structured output |
 | `retrieve` | `gemini-embedding-2` + Supabase RPC | Embeds the optimized query, calls `match_chunks_rrf` to fetch 25 candidates |
 | `rerank` | FlashRank (local) | Cross-encodes all 25 candidates, keeps top 10, formats context string |
 | `grade_context` | Gemma 4 31B | Binary relevance grade: is the context sufficient to answer the query? |
@@ -148,7 +148,7 @@ All answers pass through **NativeGuard** (`models/validation.py`) — a zero-dep
 
 The `/chat/stream` endpoint applies:
 1. **Token budget validation** — rejects oversized inputs
-2. **Injection defense** — sanitizes the prompt before graph execution
+2. **Injection defense** — dual-layer sanitization (regex filter + Groq `meta-llama/llama-prompt-guard-2-86m` semantic scanning) before graph execution
 3. **Session locking** — enforces `active_document_id` consistency across turns via the Postgres checkpointer
 
 ---

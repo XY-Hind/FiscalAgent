@@ -62,12 +62,12 @@ class QueryFilters(BaseModel):
 
 def parse_query(state: GraphState):
     """
-    Uses Groq API (Llama-3.1-8B-Instant) to parse the user question into optimized keywords and strict metadata filters.
+    Uses Groq API (qwen/qwen3.8-27b) to parse the user question into optimized keywords and strict metadata filters.
     """
     logger.info("Parsing user query for metadata extraction...")
     try:
         llm = ChatGroq(
-            model="llama-3.1-8b-instant",
+            model="qwen/qwen3.8-27b",
             groq_api_key=os.getenv("GROQ_API_KEY"),
             temperature=0
         )
